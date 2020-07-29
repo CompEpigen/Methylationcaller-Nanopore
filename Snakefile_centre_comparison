@@ -1,0 +1,584 @@
+configfile: "config.yaml"
+sample = config["samples"]
+method = config["methods"]
+
+import os
+
+def activate_environment():
+    os.system("module load gcc/7.2.0")
+    os.system("module load anaconda3/2019.07")
+    os.system("source activate /home/mayerma/.conda/envs/deepsignalenv")
+
+activate_environment()
+
+rule all:
+  input:
+    "output/deepsignal_methrix.bedGraph",
+    "output/tombo_methrix.bedGraph",
+    "output/nanopolish_methrix.bedGraph",
+    "output/bisulfite_methrix.bedGraph",
+    "output/deepsignal_methrix_Bham.bedGraph",
+    "output/nanopolish_methrix_Bham.bedGraph",
+    "output/tombo_methrix_Bham.bedGraph",
+    "output/deepsignal_methrix_Notts.bedGraph",
+    "output/nanopolish_methrix_Notts.bedGraph",
+    "output/tombo_methrix_Notts.bedGraph",
+    "output/deepsignal_methrix_UBC.bedGraph",
+    "output/nanopolish_methrix_UBC.bedGraph",
+    "output/tombo_methrix_UBC.bedGraph",
+    "output/deepsignal_methrix_UCSC.bedGraph",
+    "output/nanopolish_methrix_UCSC.bedGraph",
+    "output/tombo_methrix_UCSC.bedGraph",
+    "output/comparison/Bham_deepsignal.tsv",
+    "output/comparison/Notts_deepsignal.tsv",
+    "output/comparison/UBC_deepsignal.tsv",
+    "output/comparison/UCSC_deepsignal.tsv",
+    "output/comparison/deepsignal_frequency.tsv",
+    "output/comparison/Bham_nanopolish.tsv",
+    "output/comparison/Notts_nanopolish.tsv",
+    "output/comparison/UBC_nanopolish.tsv",
+    "output/comparison/UCSC_nanopolish.tsv",
+    "output/comparison/nanopolish_frequency.tsv",
+    "output/comparison/Bham_tombo.tsv",
+    "output/comparison/Notts_tombo.tsv",
+    "output/comparison/UBC_tombo.tsv",
+    "output/comparison/UCSC_tombo.tsv",
+    "output/comparison/tombo_frequency.tsv"
+
+
+rule multi_to_single_fast5:
+    input:
+        path = "raw/{sample}/guppy"
+    output:
+        single = directory("output/{sample}/fast5s_guppy.single.al")
+    params:
+        jobname='multi_to_single',
+        runtime='160:00',
+        memusage='10000',
+        slots='1',
+        misc=''
+    shell:
+        "multi_to_single_fast5 --input_path {input.path} --save_path {output.single} --recursive"
+
+rule tombo_resquiggle:
+    input:
+        fast5s = rules.multi_to_single_fast5.output.single,
+        reference = "GCF_000001405.26_GRCh38_genomic.fna"
+    output:
+        dummy = "output/{sample}/resquiggled_done.txt"
+    params:
+        jobname='tombo_resquiggle',
+        runtime='60:00',
+        memusage='40000',
+        slots='10',
+        misc=''
+    run:
+        shell("tombo resquiggle {input.fast5s} {input.reference} --processes 10 --overwrite")
+        shell("touch {output.dummy}")
+
+rule tombo_modifications:
+    input:
+        fast5path = rules.multi_to_single_fast5.output.single,
+        dummy = rules.tombo_resquiggle.output.dummy
+    output:
+        modifications = "output/{sample}/alt_model.CpG.tombo.stats",
+        dummy = "output/{sample}/tombo_mods_done.txt"
+    params:
+        jobname='tombo_modifications',
+        runtime='150:00',
+        memusage='90000',
+        slots='8',
+        misc=''
+    run:
+        shell("tombo detect_modifications alternative_model --fast5-basedirs {input.fast5path} --alternate-bases CpG --statistics-file-basename output/{wildcards.sample}/alt_model")
+        shell("touch output/{wildcards.sample}/tombo_mods_done.txt")
+
+rule tombo_browserfiles:
+    input:
+        fast5path = rules.multi_to_single_fast5.output.single,
+        modifications = rules.tombo_modifications.output.modifications,
+        dummy = rules.tombo_modifications.output.dummy
+    output:
+        "output/{sample}/tombo_{sample}.fraction_modified_reads.minus.wig",
+        "output/{sample}/tombo_{sample}.fraction_modified_reads.plus.wig",
+        "output/{sample}/tombo_{sample}.valid_coverage.minus.wig",
+        "output/{sample}/tombo_{sample}.valid_coverage.plus.wig"
+    params:
+        jobname='tombo_browserfiles',
+        runtime='20:00',
+        memusage='16000',
+        slots='4',
+        misc=''
+    run:
+        shell("tombo text_output browser_files --fast5-basedirs {input.fast5path} --statistics-filename {input.modifications} --file-types fraction valid_coverage --browser-file-basename output/{wildcards.sample}/tombo_{wildcards.sample} ")
+
+rule gather_all_tombo:
+    input:
+        expand("output/{SAMPLE}/tombo_{SAMPLE}.fraction_modified_reads.minus.wig",SAMPLE = sample),
+        expand("output/{SAMPLE}/tombo_{SAMPLE}.fraction_modified_reads.plus.wig",SAMPLE = sample)
+    output:
+        "output/all_tombo_frequency.tsv"
+    params:
+        jobname='gather_tombo',
+        runtime='10:00',
+        memusage='16000',
+        slots='4',
+        misc=''
+    shell:
+        "cat {input} >> {output}"
+
+rule deepsignal:
+    input:
+        fast5s = rules.tombo_resquiggle.input.fast5s,
+        resquiggled = rules.tombo_resquiggle.output.dummy,
+        reference = "GCF_000001405.26_GRCh38_genomic.fna"
+    output:
+        calls = "output/{sample}/fast5s.al.CpG.signal_features.17bases.rawsignals_360.tsv",
+        call_mods = "output/{sample}/fast5s.al.CpG.call_mods.tsv"
+    params:
+        jobname='deepsignal',
+        runtime='180:00',
+        memusage='80000',
+        slots='10',
+        misc=''
+    run:
+        shell("deepsignal extract --fast5_dir {input.fast5s} --reference_path {input.reference} --write_path {output.calls} --nproc 10")
+        shell("deepsignal call_mods --input_path {output.calls} --model_path model.CpG.R9.4_1D.human_hx1.bn17.sn360.v0.1.7+/bn_17.sn_360.epoch_9.ckpt --result_file {output.call_mods} --nproc 10 --is_gpu no")
+
+rule deepsignal_call_mods:
+    input:
+        script = "call_modification_frequency.py",
+        call_mods = rules.deepsignal.output.call_mods
+    output:
+        mods_frequency = "output/{sample}/deepsignal_frequency.tsv"
+    params:
+        jobname='deepsignal_call_mods',
+        runtime='50:00',
+        memusage='16000',
+        slots='8',
+        misc=''
+    shell:
+        "python {input.script} --input_path {input.call_mods} --result_file {output.mods_frequency} --prob_cf 0"
+
+rule gather_all_deepsignal:
+    input:
+        expand("output/{SAMPLE}/deepsignal_frequency.tsv", SAMPLE = sample)
+    output:
+        "output/all_deepsignal_frequency.tsv"
+    params:
+        jobname='gather_deepsignal',
+        runtime='10:00',
+        memusage='8000',
+        slots='4',
+        misc=''
+    shell:
+        "cat {input} >> {output}"
+
+rule frequency_to_methrix:
+    input:
+        "output/all_{method}_frequency.tsv"
+    output:
+        "output/{method}_methrix.bedGraph"
+    params:
+        jobname='frequency_to_methrix',
+        runtime='30:00',
+        memusage='20000',
+        slots='4',
+        misc=''
+    run:
+        shell("python3 calc_freq_for_methrix.py --input_file {input} --result_file {output}")
+"""
+    gather by centre: deepsignal
+"""
+rule gather_centre_Bham_deepsignal:
+    input:
+        "output/FAB49712-622291475_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAB49908-481119249_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAF01127-353303576_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAF01169-4245879798_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAF01253-83756522_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv"
+    output:
+        "output/all_Bham_deepsignal.tsv"
+    params:
+        jobname='gather_deepsignal',
+        runtime='10:00',
+        memusage='8000',
+        slots='4',
+        misc=''
+    shell:
+        "cat {input} >> {output}"
+
+rule gather_centre_Notts_deepsignal:
+    input:
+        "output/FAB39088-288418386_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAB42316-216722908_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAB42451-4239353418_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAB45271-152889212_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAB45277-86567043_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAB49914-3775529215_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv"
+    output:
+        "output/all_Notts_deepsignal.tsv"
+    params:
+        jobname='gather_deepsignal',
+        runtime='10:00',
+        memusage='8000',
+        slots='4',
+        misc=''
+    shell:
+        "cat {input} >> {output}"
+
+rule gather_centre_UBC_deepsignal:
+    input:
+        "output/FAB39075-4246400039_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAB42473-4179682758_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAB45332-551111640_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAF05869-87644245_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAF18554-4178920553_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv"
+    output:
+        "output/all_UBC_deepsignal.tsv"
+    params:
+        jobname='gather_deepsignal',
+        runtime='10:00',
+        memusage='8000',
+        slots='4',
+        misc=''
+    shell:
+        "cat {input} >> {output}"
+
+rule gather_centre_UCSC_deepsignal:
+    input:
+        "output/FAB44989-2567311907_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv",
+        "output/FAB49164-4045668814_Multi_SQK-LSK108_WA01/deepsignal_frequency.tsv"
+    output:
+        "output/all_UCSC_deepsignal.tsv"
+    params:
+        jobname='gather_deepsignal',
+        runtime='10:00',
+        memusage='8000',
+        slots='4',
+        misc=''
+    shell:
+        "cat {input} >> {output}"
+
+"""
+    gather by centre: tombo
+"""
+rule gather_centre_Bham_tombo:
+    input:
+        "output/FAB49712-622291475_Multi_SQK-LSK108_WA01/tombo_FAB49712-622291475_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAB49908-481119249_Multi_SQK-LSK108_WA01/tombo_FAB49908-481119249_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAF01127-353303576_Multi_SQK-LSK108_WA01/tombo_FAF01127-353303576_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAF01169-4245879798_Multi_SQK-LSK108_WA01/tombo_FAF01169-4245879798_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAF01253-83756522_Multi_SQK-LSK108_WA01/tombo_FAF01253-83756522_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAB49712-622291475_Multi_SQK-LSK108_WA01/tombo_FAB49712-622291475_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAB49908-481119249_Multi_SQK-LSK108_WA01/tombo_FAB49908-481119249_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAF01127-353303576_Multi_SQK-LSK108_WA01/tombo_FAF01127-353303576_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAF01169-4245879798_Multi_SQK-LSK108_WA01/tombo_FAF01169-4245879798_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAF01253-83756522_Multi_SQK-LSK108_WA01/tombo_FAF01253-83756522_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig"
+    output:
+        "output/all_Bham_tombo.tsv"
+    params:
+        jobname='gather_tombo',
+        runtime='10:00',
+        memusage='8000',
+        slots='4',
+        misc=''
+    shell:
+        "cat {input} >> {output}"
+
+rule gather_centre_Notts_tombo:
+    input:
+        "output/FAB39088-288418386_Multi_SQK-LSK108_WA01/tombo_FAB39088-288418386_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAB42316-216722908_Multi_SQK-LSK108_WA01/tombo_FAB42316-216722908_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAB42451-4239353418_Multi_SQK-LSK108_WA01/tombo_FAB42451-4239353418_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAB45271-152889212_Multi_SQK-LSK108_WA01/tombo_FAB45271-152889212_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAB45277-86567043_Multi_SQK-LSK108_WA01/tombo_FAB45277-86567043_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAB49914-3775529215_Multi_SQK-LSK108_WA01/tombo_FAB49914-3775529215_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAB39088-288418386_Multi_SQK-LSK108_WA01/tombo_FAB39088-288418386_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAB42316-216722908_Multi_SQK-LSK108_WA01/tombo_FAB42316-216722908_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAB42451-4239353418_Multi_SQK-LSK108_WA01/tombo_FAB42451-4239353418_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAB45271-152889212_Multi_SQK-LSK108_WA01/tombo_FAB45271-152889212_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAB45277-86567043_Multi_SQK-LSK108_WA01/tombo_FAB45277-86567043_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAB49914-3775529215_Multi_SQK-LSK108_WA01/tombo_FAB49914-3775529215_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig"
+    output:
+        "output/all_Notts_tombo.tsv"
+    params:
+        jobname='gather_tombo',
+        runtime='10:00',
+        memusage='8000',
+        slots='4',
+        misc=''
+    shell:
+        "cat {input} >> {output}"
+
+rule gather_centre_UBC_tombo:
+    input:
+        "output/FAB39075-4246400039_Multi_SQK-LSK108_WA01/tombo_FAB39075-4246400039_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAB42473-4179682758_Multi_SQK-LSK108_WA01/tombo_FAB42473-4179682758_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAB45332-551111640_Multi_SQK-LSK108_WA01/tombo_FAB45332-551111640_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAF05869-87644245_Multi_SQK-LSK108_WA01/tombo_FAF05869-87644245_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAF18554-4178920553_Multi_SQK-LSK108_WA01/tombo_FAF18554-4178920553_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAB39075-4246400039_Multi_SQK-LSK108_WA01/tombo_FAB39075-4246400039_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAB42473-4179682758_Multi_SQK-LSK108_WA01/tombo_FAB42473-4179682758_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAB45332-551111640_Multi_SQK-LSK108_WA01/tombo_FAB45332-551111640_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAF05869-87644245_Multi_SQK-LSK108_WA01/tombo_FAF05869-87644245_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAF18554-4178920553_Multi_SQK-LSK108_WA01/tombo_FAF18554-4178920553_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig"
+    output:
+        "output/all_UBC_tombo.tsv"
+    params:
+        jobname='gather_tombol',
+        runtime='10:00',
+        memusage='8000',
+        slots='4',
+        misc=''
+    shell:
+        "cat {input} >> {output}"
+
+rule gather_centre_UCSC_tombo:
+    input:
+        "output/FAB44989-2567311907_Multi_SQK-LSK108_WA01/tombo_FAB44989-2567311907_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAB49164-4045668814_Multi_SQK-LSK108_WA01/tombo_FAB49164-4045668814_Multi_SQK-LSK108_WA01.fraction_modified_reads.minus.wig",
+        "output/FAB44989-2567311907_Multi_SQK-LSK108_WA01/tombo_FAB44989-2567311907_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig",
+        "output/FAB49164-4045668814_Multi_SQK-LSK108_WA01/tombo_FAB49164-4045668814_Multi_SQK-LSK108_WA01.fraction_modified_reads.plus.wig"
+    output:
+        "output/all_UCSC_tombo.tsv"
+    params:
+        jobname='gather_tombo',
+        runtime='10:00',
+        memusage='8000',
+        slots='4',
+        misc=''
+    shell:
+        "cat {input} >> {output}"
+"""
+    gather by centre: nanopolish
+"""
+rule gather_centre_Bham_nanopolish:
+    input:
+        folder = "/icgc/dkfzlsdf/analysis/C010/mayerma/nanopolish/Bham",
+        script = "/icgc/dkfzlsdf/analysis/C010/mayerma/nanopolish/original_nanopolish_calculate_methylation_frequency.py"
+    output:
+        "output/all_Bham_nanopolish.tsv"
+    params:
+        jobname='gather_nanopolish',
+        runtime='10:00',
+        memusage='8000',
+        slots='4',
+        misc=''
+    shell:
+        "python3 {input.script} --split-groups /icgc/dkfzlsdf/analysis/C010/mayerma/nanopolish/Bham/* > {output}"
+
+rule gather_centre_Notts_nanopolish:
+    input:
+        folder = "/icgc/dkfzlsdf/analysis/C010/mayerma/nanopolish/Notts/",
+        script = "/icgc/dkfzlsdf/analysis/C010/mayerma/nanopolish/original_nanopolish_calculate_methylation_frequency.py"
+    output:
+        "output/all_Notts_nanopolish.tsv"
+    params:
+        jobname='gather_nanopolish',
+        runtime='10:00',
+        memusage='8000',
+        slots='4',
+        misc=''
+    shell:
+        "python3 {input.script} --split-groups /icgc/dkfzlsdf/analysis/C010/mayerma/nanopolish/Notts/* > {output}"
+
+rule gather_centre_UBC_nanopolish:
+    input:
+        folder = "/icgc/dkfzlsdf/analysis/C010/mayerma/nanopolish/UBC/",
+        script = "/icgc/dkfzlsdf/analysis/C010/mayerma/nanopolish/original_nanopolish_calculate_methylation_frequency.py"
+    output:
+        "output/all_UBC_nanopolish.tsv"
+    params:
+        jobname='gather_nanopolish',
+        runtime='10:00',
+        memusage='8000',
+        slots='4',
+        misc=''
+    shell:
+        "python3 {input.script} --split-groups /icgc/dkfzlsdf/analysis/C010/mayerma/nanopolish/UBC/* > {output}"
+
+rule gather_centre_UCSC_nanopolish:
+    input:
+        folder = "/icgc/dkfzlsdf/analysis/C010/mayerma/nanopolish/UCSC/",
+        script = "/icgc/dkfzlsdf/analysis/C010/mayerma/nanopolish/original_nanopolish_calculate_methylation_frequency.py"
+    output:
+        "output/all_UCSC_nanopolish.tsv"
+    params:
+        jobname='gather_nanopolish',
+        runtime='10:00',
+        memusage='8000',
+        slots='4',
+        misc=''
+    shell:
+        "python3 {input.script} --split-groups /icgc/dkfzlsdf/analysis/C010/mayerma/nanopolish/UCSC/* > {output}"
+
+"""
+Frequency to methrix by centre
+"""
+
+rule frequency_to_methrix_Bahm:
+    input:
+        deepsignal = "output/all_Bham_deepsignal.tsv",
+        nanopolish = "output/all_Bham_nanopolish.tsv",
+        tombo = "output/all_Bham_tombo.tsv"
+    output:
+        deepsignal = "output/deepsignal_methrix_Bham.bedGraph",
+        nanopolish = "output/nanopolish_methrix_Bham.bedGraph",
+        tombo = "output/tombo_methrix_Bham.bedGraph"
+    params:
+        jobname='frequency_to_methrix',
+        runtime='30:00',
+        memusage='20000',
+        slots='4',
+        misc=''
+    run:
+        shell("python3 calc_freq_for_methrix.py --input_file {input.deepsignal} --result_file {output.deepsignal}")
+        shell("python3 calc_freq_for_methrix.py --input_file {input.nanopolish} --result_file {output.nanopolish}")
+        shell("python3 calc_freq_for_methrix.py --input_file {input.tombo} --result_file {output.tombo}")
+
+
+rule frequency_to_methrix_Notts:
+    input:
+        deepsignal = "output/all_Notts_deepsignal.tsv",
+        nanopolish = "output/all_Notts_nanopolish.tsv",
+        tombo = "output/all_Notts_tombo.tsv"
+    output:
+        deepsignal = "output/deepsignal_methrix_Notts.bedGraph",
+        nanopolish = "output/nanopolish_methrix_Notts.bedGraph",
+        tombo = "output/tombo_methrix_Notts.bedGraph"
+    params:
+        jobname='frequency_to_methrix',
+        runtime='30:00',
+        memusage='20000',
+        slots='4',
+        misc=''
+    run:
+        shell("python3 calc_freq_for_methrix.py --input_file {input.deepsignal} --result_file {output.deepsignal}")
+        shell("python3 calc_freq_for_methrix.py --input_file {input.nanopolish} --result_file {output.nanopolish}")
+        shell("python3 calc_freq_for_methrix.py --input_file {input.tombo} --result_file {output.tombo}")
+
+
+rule frequency_to_methrix_UBC:
+    input:
+        deepsignal = "output/all_UBC_deepsignal.tsv",
+        nanopolish = "output/all_UBC_nanopolish.tsv",
+        tombo = "output/all_UBC_tombo.tsv"
+    output:
+        deepsignal = "output/deepsignal_methrix_UBC.bedGraph",
+        nanopolish = "output/nanopolish_methrix_UBC.bedGraph",
+        tombo = "output/tombo_methrix_UBC.bedGraph"
+    params:
+        jobname='frequency_to_methrix',
+        runtime='30:00',
+        memusage='20000',
+        slots='4',
+        misc=''
+    run:
+        shell("python3 calc_freq_for_methrix.py --input_file {input.deepsignal} --result_file {output.deepsignal}")
+        shell("python3 calc_freq_for_methrix.py --input_file {input.nanopolish} --result_file {output.nanopolish}")
+        shell("python3 calc_freq_for_methrix.py --input_file {input.tombo} --result_file {output.tombo}")
+
+
+rule frequency_to_methrix_UCSC:
+    input:
+        deepsignal = "output/all_UCSC_deepsignal.tsv",
+        nanopolish = "output/all_UCSC_nanopolish.tsv",
+        tombo = "output/all_UCSC_tombo.tsv"
+    output:
+        deepsignal = "output/deepsignal_methrix_UCSC.bedGraph",
+        nanopolish = "output/nanopolish_methrix_UCSC.bedGraph",
+        tombo = "output/tombo_methrix_UCSC.bedGraph"
+    params:
+        jobname='frequency_to_methrix',
+        runtime='30:00',
+        memusage='20000',
+        slots='4',
+        misc=''
+    run:
+        shell("python3 calc_freq_for_methrix.py --input_file {input.deepsignal} --result_file {output.deepsignal}")
+        shell("python3 calc_freq_for_methrix.py --input_file {input.nanopolish} --result_file {output.nanopolish}")
+        shell("python3 calc_freq_for_methrix.py --input_file {input.tombo} --result_file {output.tombo}")
+
+
+"""
+    comparison of methylation frequency
+"""
+
+rule compare_tombo:
+      input:
+          Bham = "output/all_Bham_tombo.tsv",
+          Notts = "output/all_Notts_tombo.tsv",
+          UBC = "output/all_UBC_tombo.tsv",
+          UCSC = "output/all_UCSC_tombo.tsv",
+          all = "output/all_tombo_frequency.tsv"
+      output:
+          Bham = "output/comparison/Bham_tombo.tsv",
+          Notts = "output/comparison/Notts_tombo.tsv",
+          UBC = "output/comparison/UBC_tombo.tsv",
+          UCSC = "output/comparison/UCSC_tombo.tsv",
+          all = "output/comparison/tombo_frequency.tsv"
+      params:
+          jobname='frequency_comparison',
+          runtime='30:00',
+          memusage='20000',
+          slots='4',
+          misc=''
+      run:
+          shell("python3 freq_comparison.py --input_file {input.Bham} --result_file {output.Bham}")
+          shell("python3 freq_comparison.py --input_file {input.Notts} --result_file {output.Notts}")
+          shell("python3 freq_comparison.py --input_file {input.UBC} --result_file {output.UBC}")
+          shell("python3 freq_comparison.py --input_file {input.UCSC} --result_file {output.UCSC}")
+          shell("python3 freq_comparison.py --input_file {input.all} --result_file {output.all}")
+
+rule compare_nanopolish:
+      input:
+          Bham = "output/all_Bham_nanopolish.tsv",
+          Notts = "output/all_Notts_nanopolish.tsv",
+          UBC = "output/all_UBC_nanopolish.tsv",
+          UCSC = "output/all_UCSC_nanopolish.tsv",
+          all = "output/all_nanopolish_frequency.tsv"
+      output:
+          Bham = "output/comparison/Bham_nanopolish.tsv",
+          Notts = "output/comparison/Notts_nanopolish.tsv",
+          UBC = "output/comparison/UBC_nanopolish.tsv",
+          UCSC = "output/comparison/UCSC_nanopolish.tsv",
+          all = "output/comparison/nanopolish_frequency.tsv"
+      params:
+          jobname='frequency_comparison',
+          runtime='30:00',
+          memusage='20000',
+          slots='4',
+          misc=''
+      run:
+          shell("python3 freq_comparison.py --input_file {input.Bham} --result_file {output.Bham}")
+          shell("python3 freq_comparison.py --input_file {input.Notts} --result_file {output.Notts}")
+          shell("python3 freq_comparison.py --input_file {input.UBC} --result_file {output.UBC}")
+          shell("python3 freq_comparison.py --input_file {input.UCSC} --result_file {output.UCSC}")
+          shell("python3 freq_comparison.py --input_file {input.all} --result_file {output.all}")
+
+rule compare_deepsignal:
+      input:
+          Bham = "output/all_Bham_deepsignal.tsv",
+          Notts = "output/all_Notts_deepsignal.tsv",
+          UBC = "output/all_UBC_deepsignal.tsv",
+          UCSC = "output/all_UCSC_deepsignal.tsv",
+          all = "output/all_deepsignal_frequency.tsv"
+      output:
+          Bham = "output/comparison/Bham_deepsignal.tsv",
+          Notts = "output/comparison/Notts_deepsignal.tsv",
+          UBC = "output/comparison/UBC_deepsignal.tsv",
+          UCSC = "output/comparison/UCSC_deepsignal.tsv",
+          all = "output/comparison/deepsignal_frequency.tsv"
+      params:
+          jobname='frequency_comparison',
+          runtime='30:00',
+          memusage='20000',
+          slots='4',
+          misc=''
+      run:
+          shell("python3 freq_comparison.py --input_file {input.Bham} --result_file {output.Bham}")
+          shell("python3 freq_comparison.py --input_file {input.Notts} --result_file {output.Notts}")
+          shell("python3 freq_comparison.py --input_file {input.UBC} --result_file {output.UBC}")
+          shell("python3 freq_comparison.py --input_file {input.UCSC} --result_file {output.UCSC}")
+          shell("python3 freq_comparison.py --input_file {input.all} --result_file {output.all}")
